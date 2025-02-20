@@ -13,6 +13,8 @@ public class MLRocketController : Agent
     private const float MOON_GRAVITY = -1.62f;
     [SerializeField] private float maxFuel = 100f;
     [SerializeField] private float fuelConsumptionRate = 10f;
+    [SerializeField] private float groundCheckDistance = 5f;
+    [SerializeField] private float autoAlignThreshold = 0.95f;
     private float currentFuel;
     [SerializeField] private ParticleSystem thrustParticles;
     [SerializeField] private Color debugLineColor = Color.yellow;
@@ -30,40 +32,9 @@ public class MLRocketController : Agent
     private Vector3 lastPosition;
     private float bestDistance;
     private Vector3 targetThrustPos;
-
-    private void OnDrawGizmos()
-    {
-        if (!Application.isPlaying || areaSelector == null) return;
-
-        Gizmos.color = debugLineColor;
-        Gizmos.DrawLine(transform.position, targetCenter);
-
-        Gizmos.color = Color.green;
-        Gizmos.DrawWireSphere(targetCenter, 1f);
-
-        if (rb != null)
-        {
-            Gizmos.color = Color.red;
-            Gizmos.DrawRay(transform.position, rb.velocity);
-        }
-
-        Vector3 cameraPosition = Camera.main.transform.position;
-        Vector3 fuelTextPosition = cameraPosition + Camera.main.transform.forward * 10f 
-                                 - Camera.main.transform.right * 4f 
-                                 + Camera.main.transform.up * 3f;
-
-        Gizmos.color = Color.black;
-        Gizmos.DrawCube(fuelTextPosition, new Vector3(2f, 0.3f, 0.01f));
-
-        Gizmos.color = Color.yellow;
-        float fuelPercentage = currentFuel / maxFuel;
-        Vector3 fuelBarPosition = fuelTextPosition - new Vector3(1f - fuelPercentage, 0f, 0f);
-        Gizmos.DrawCube(fuelBarPosition, new Vector3(2f * fuelPercentage, 0.2f, 0.02f));
-
-        Gizmos.color = Color.blue;
-        Vector3 thrustDirection = transform.TransformDirection(thrustPoint.transform.localPosition).normalized;
-        Gizmos.DrawRay(transform.TransformPoint(thrustPoint.transform.localPosition), -thrustDirection * 2f);
-    }
+    private bool isThrustActive = false;
+    private bool isAutoAligning = false;
+    private VisualDebug visualDebug;
 
     public override void Initialize()
     {
@@ -78,6 +49,8 @@ public class MLRocketController : Agent
         rb.maxAngularVelocity = maxRotationSpeed;
         rb.constraints = RigidbodyConstraints.FreezeAll;
         lastThrustDirection = Vector3.up;
+        rb.collisionDetectionMode = CollisionDetectionMode.Continuous;
+        visualDebug = GetComponent<VisualDebug>();
     }
 
     void Update()
@@ -90,6 +63,26 @@ public class MLRocketController : Agent
             bestDistance = maxDistance;
             rb.constraints = RigidbodyConstraints.None;
         }
+        if (visualDebug != null)
+    {
+        float fuelPercentage = currentFuel / maxFuel;
+        float velocityMagnitude = rb.velocity.magnitude;
+        float height = transform.position.y - targetCenter.y;
+        float alignment = Vector3.Dot(transform.up, Vector3.up);
+        
+        visualDebug.UpdateHUD(fuelPercentage, velocityMagnitude, height, alignment);
+        
+        Vector3 thrustPos = transform.TransformPoint(thrustPoint.transform.localPosition);
+        Vector3 thrustDir = transform.TransformDirection(thrustPoint.transform.localPosition).normalized;
+        
+        visualDebug.UpdateVisuals(
+            transform.position,
+            targetCenter,
+            rb.velocity,
+            thrustPos,
+            thrustDir
+        );
+    }
     }
 
     public override void OnEpisodeBegin()
@@ -107,6 +100,12 @@ public class MLRocketController : Agent
         bestDistance = maxDistance;
         isAreaSelected = false;
         rb.constraints = RigidbodyConstraints.FreezeAll;
+        
+        if (thrustParticles != null && thrustParticles.isPlaying)
+        {
+            thrustParticles.Stop();
+        }
+        isThrustActive = false;
 
         if (areaSelector != null && areaSelector.IsAreaFixed())
         {
@@ -133,7 +132,24 @@ public class MLRocketController : Agent
 
     public override void OnActionReceived(ActionBuffers actions)
     {
-        if (!isAreaSelected || currentFuel <= 0 || isLanded) return;
+        if (!isAreaSelected || isLanded) 
+        {
+            StopThrustParticles();
+            return;
+        }
+
+        if (Physics.Raycast(transform.position, Vector3.down, out RaycastHit hit, groundCheckDistance, groundLayer))
+        {
+            float currentAlignment = Vector3.Dot(transform.up, Vector3.up);
+            if (currentAlignment >= autoAlignThreshold && currentAlignment < 1.0f)
+            {
+                isAutoAligning = true;
+                AutoAlign();
+                return;
+            }
+        }
+
+        isAutoAligning = false;
 
         float thrust = Mathf.Clamp01(actions.ContinuousActions[0]);
         float thrustX = Mathf.Clamp(actions.ContinuousActions[1], -1f, 1f);
@@ -152,48 +168,85 @@ public class MLRocketController : Agent
             targetThrustPos,
             Time.fixedDeltaTime * 10f
         );
-        if (Physics.Raycast(transform.position, Vector3.down, out RaycastHit hit, 5f, groundLayer) &&
-    IsWithinLandingArea(transform.position))
-{
-    isInLandingPhase = true;
-    StabilizeForLanding();
-}
-else
-{
-    isInLandingPhase = false;
-}
-
 
         bool hasRotation = Mathf.Abs(thrustX) > 0.1f || Mathf.Abs(thrustZ) > 0.1f;
-        if ((thrust > 0 || hasRotation) && currentFuel > 0)
+        
+        if (currentFuel > 0f)
         {
-            if (hasRotation && thrust <= 0)
+            StartThrustParticles();
+            if (thrust > 0 || hasRotation)
             {
-                thrust = 1.0f;
+                if (hasRotation && thrust <= 0)
+                {
+                    thrust = 1.0f;
+                }
+
+                Vector3 mainThrustDirection = transform.up;
+                rb.AddForce(mainThrustDirection * thrustForce * thrust * thrustMultiplier * Time.fixedDeltaTime, 
+                    ForceMode.Force);
+
+                if (hasRotation)
+                {
+                    Vector3 xRotation = transform.right * thrustZ;
+                    Vector3 zRotation = -transform.forward * thrustX;
+                    Vector3 torque = (xRotation + zRotation) * thrustForce * thrust * 0.1f;
+                    rb.AddTorque(torque * thrustMultiplier * Time.fixedDeltaTime);
+                }
+
+                currentFuel -= thrust * fuelConsumptionRate * Time.fixedDeltaTime;
+                lastThrustDirection = mainThrustDirection;
             }
-
-            Vector3 mainThrustDirection = transform.up;
-            rb.AddForce(mainThrustDirection * thrustForce * thrust * thrustMultiplier * Time.fixedDeltaTime, 
-                ForceMode.Force);
-
-            if (Mathf.Abs(thrustX) > 0.1f || Mathf.Abs(thrustZ) > 0.1f)
+            else
             {
-                Vector3 xRotation = transform.right * thrustZ;
-                Vector3 zRotation = -transform.forward * thrustX;
-                Vector3 torque = (xRotation + zRotation) * thrustForce * thrust * 0.1f;
-                rb.AddTorque(torque * thrustMultiplier * Time.fixedDeltaTime);
+                currentFuel -= 0.1f * fuelConsumptionRate * Time.fixedDeltaTime;
             }
-
-            currentFuel -= thrust * fuelConsumptionRate * Time.fixedDeltaTime;
-            lastThrustDirection = mainThrustDirection;
         }
-        else if (thrustParticles.isPlaying)
+        else
         {
-            thrustParticles.Stop();
+            StopThrustParticles();
         }
 
         rb.AddForce(Vector3.up * MOON_GRAVITY * rb.mass, ForceMode.Acceleration);
         CalculateRewards();
+    }
+
+    private void AutoAlign()
+    {
+        Vector3 currentUp = transform.up;
+        Vector3 targetUp = Vector3.up;
+        
+        Quaternion targetRotation = Quaternion.FromToRotation(currentUp, targetUp) * transform.rotation;
+        
+        transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, Time.fixedDeltaTime * 5f);
+        
+        rb.angularVelocity = Vector3.Lerp(rb.angularVelocity, Vector3.zero, Time.fixedDeltaTime * 10f);
+        
+        rb.AddForce(Vector3.up * thrustForce * 0.1f * Time.fixedDeltaTime, ForceMode.Force);
+        
+        Vector3 horizontalVelocity = new Vector3(rb.velocity.x, 0f, rb.velocity.z);
+        rb.velocity = new Vector3(
+            Mathf.Lerp(rb.velocity.x, 0f, Time.fixedDeltaTime * 3f),
+            rb.velocity.y,
+            Mathf.Lerp(rb.velocity.z, 0f, Time.fixedDeltaTime * 3f)
+        );
+    }
+
+    private void StartThrustParticles()
+    {
+        if (thrustParticles != null && !thrustParticles.isPlaying)
+        {
+            thrustParticles.Play();
+            isThrustActive = true;
+        }
+    }
+
+    private void StopThrustParticles()
+    {
+        if (thrustParticles != null && thrustParticles.isPlaying)
+        {
+            thrustParticles.Stop();
+            isThrustActive = false;
+        }
     }
     private void StabilizeForLanding()
 {
@@ -266,7 +319,6 @@ else
         AddReward(currentAlignment * alignmentImportance * 0.2f);
     }
 
-    // Перевірка приземлення
     if (Physics.Raycast(transform.position, Vector3.down, out RaycastHit hit, 1f, groundLayer))
     {
         if (IsWithinLandingArea(transform.position))
@@ -311,17 +363,10 @@ else
         continuousActions[1] = horizontal;
         continuousActions[2] = vertical;
 
-        if (Input.GetKey(KeyCode.Space))
-        {
-            continuousActions[0] = 1.0f;
-        }
-        else if (Mathf.Abs(horizontal) > 0.1f || Mathf.Abs(vertical) > 0.1f)
-        {
-            continuousActions[0] = 1.0f;
-        }
-        else
-        {
-            continuousActions[0] = 0f;
-        }
+        bool shouldThrust = Input.GetKey(KeyCode.Space) || 
+                          Mathf.Abs(horizontal) > 0.1f || 
+                          Mathf.Abs(vertical) > 0.1f;
+        
+        continuousActions[0] = shouldThrust ? 1.0f : 0f;
     }
 }
